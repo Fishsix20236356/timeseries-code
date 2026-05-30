@@ -1,0 +1,74 @@
+## 3 The Chronos-2 Model
+
+In this section, we introduce the Chronos-2 model. We begin with scaling and tokenization, followed by the model's architecture including the group attention mechanism which enables Chronos-2's in-context learning capabilities. Subsequently, we discuss the training and inference pipelines of Chronos-2. The complete inference pipeline of Chronos-2 is visualized in Figure 1.
+
+### 3.1 Scaling and Tokenization
+
+Input Construction. The model operates on two inputs derived from the target  $ Y_{1:T} $  and covariates  $ X_{1:T+H} $ . We concatenate all historical values into  $ V = [v_{1}, \ldots, v_{T}] $ , where each  $ v_{t} \in R^{D+M} $  consists of the target observation  $ y_{t} $  and the corresponding covariate vector  $ x_{t} $ . Similarly, we define the future values as  $ W = [w_{T+1}, \ldots, w_{T+H}] $ , where  $ w_{t} \in R^{D+M} $  contains known future covariate values  $ x_{t} $  when available, while the entries corresponding to targets and past-only covariates are set to missing values.
+
+Categorical covariates in  $ X_{1:T+H} $  are transformed into real-valued representations before being concatenated into V and W. For univariate targets, we apply target encoding (Pedregosa et al., 2011; Micci-Barreca, 2001), which maps each category to a numerical value based on its relationship with the target. For multivariate targets, the model falls back to ordinal encoding, assigning a unique integer to each category.
+
+Robust Scaling. The input values, V and W, may be at an arbitrary scale, so our tokenization pipeline begins by normalizing the series. We adopt standardization, a widely used normalization method in the literature, and introduce an additional step: applying the  $ \sinh^{-1} $  transformation to the standardized values. This log-like transformation further stabilizes variance and reduces the influence of outliers on the objective function. It has been used in econometrics (Burbidge et al., 1988) and energy price forecasting (Uniejewski & Weron, 2018) literature for handling extreme values. Formally, each historical value  $ v_{t,d} $  and the future value  $ w_{t,d} $  are normalized as
+
+ $$ \tilde{v}_{t,d}=\sinh^{-1}\left(\frac{v_{t,d}-\mu_{d}}{\sigma_{d}}\right) $$ 
+
+$$  \mathrm{f o r}t\in\{1,\cdots,T\},   \tag*{(1)}$$
+
+ $$ \tilde{w}_{t,d}=\sinh^{-1}\left(\frac{w_{t,d}-\mu_{d}}{\sigma_{d}}\right) $$ 
+
+$$  \mathbf{f o r}t\in\{T+1,\cdots,T+H\},   \tag*{(2)}$$where  $ \mu_{d} $  and  $ \sigma_{d} $  are the mean and standard deviation of the historical values  $ [v_{1,d},...,v_{T,d}] $ , respectively. Any missing values in V are excluded when computing  $ \mu_{d} $  and  $ \sigma_{d} $ . The normalized historical values  $ \tilde{V} $  and future values  $ \tilde{W} $  are concatenated to construct the input matrix  $ \boldsymbol{U}=[\tilde{\boldsymbol{V}},\tilde{\boldsymbol{W}}]\in\mathbb{R}^{(T+H)\times(D+M)} $ .
+
+Meta Features. During tokenization, each dimension of U is processed independently by the model. To describe the tokenization procedure, consider a single column  $ \pmb{u}_{d} = [u_{1,d}, \ldots, u_{T+H,d}]^{\top} $  corresponding to one target or covariate dimension d. Two additional meta features are appended to each column: a time index and a mask. The time index  $ j = \left[-\frac{T}{C}, -\frac{T-1}{C}, \ldots, 0, \ldots, \frac{H-1}{C}\right] $  encodes the relative position of each time step, where C is the maximum context length supported by the model. It provides explicit information about temporal ordering to the model which is beneficial when using patch-based inputs. The mask  $ m_{d} $  is a binary indicator equal to 1 when the value is observed, and 0 otherwise. It serves two purposes: indicating which values are missing in the historical context and specifying which input dimensions correspond to future-known covariates. After construction of the mask, all missing values in  $ u_{d} $  are replaced with zeros.
+
+Patching and Embedding. The input  $ u_{d} $  with the corresponding meta features, j and  $ m_{d} $ , are split into non-overlapping patches of length P (Nie et al., 2023). The context and future sections of the time series and meta features are split into patches separately. When T and H are not multiples of P, zero padding is applied on the left (context) or right (future). Let  $ \overline{u}_{p}, \overline{j}_{p} $ , and  $ \overline{m}_{p} $  denote the p-th patches of the input, time index, and mask, respectively. These are concatenated and mapped into the embedding space using a residual network,  $ f_{\phi}^{in}: R^{3P} \to R^{D_{model}} $ .
+
+$$  \begin{array}{r}{\pmb{h}_{p}=f_{\phi}^{\mathrm{i n}}\left(\left[\overline{{\pmb{u}}}_{p},\overline{{\pmb{j}}}_{p},\overline{{\pmb{m}}}_{p}\right]\right),}\end{array}   \tag*{(3)}$$
+
+where  $ \phi $  denotes parameters of the residual network and  $ D_{model} $  is the hidden dimension of the transformer model. Between the patch embeddings of the context and future, we include a special REG token which serves both as a separator token and an attention sink (Xiao et al., 2024).
+
+### 3.2 Architecture
+
+Chronos-2 is an encoder-only transformer (Vaswani et al., 2017) model which closely follows the design of the T5 encoder (Raffel et al., 2020). In the following, we discuss the key architectural components of Chronos-2.
+
+Time Attention. The time attention layer is the usual attention layer found in typical sequence models. It applies self-attention along the temporal axis and aggregates information across patches of the same input dimension. We replace relative position embeddings used in the self-attention layers of the original T5 model with rotary position embeddings (RoPE) (Su et al., 2024) which have become the de-facto standard for position embeddings in modern transformer-based models (Touvron et al., 2023).
+
+Group Attention. We introduce a group attention layer into the transformer stack, which is central to enabling the in-context learning capabilities of Chronos-2. This layer aggregates information across time series that belong to the same group at a given patch index. A group refers to a set of related time series and may refer to different things depending on the forecasting task. For example, a group may consist of:
+
+ a single time series: the minimal grouping where the model makes univariate predictions without referring to other time series in the batch.
+
+- a set of time series with shared source or metadata: this grouping enables the model to perform cross learning across items by making joint predictions for related time series (also referred to as few-shot learning) instead of generating univariate forecasts by solely taking the histories of individual time series into account. Sharing information between related time series could be especially helpful when all or some (cold start scenario) time series have short histories and when the characteristics of the downstream dataset differ considerably from the training data distribution.
+
+ a set of variates with shared dynamics: this grouping enables multivariate forecasting where the model jointly predicts all variates with shared dynamics.
+
+ a set of target(s), past-only covariates and known covariates: the most general case where the model forecasts targets while taking covariates into account.Within a batch of size B, multiple groups of varying sizes are possible, each identified by group IDs g, a vector of length B. Internally, the group attention layer maps these IDs to a two-dimensional attention mask, ensuring that aggregation occurs only within groups and not across them. Since time series within a group lack a natural ordering, the group attention layer omits positional embeddings.
+
+Quantile Head. After a sequence of alternating time and group attention layers, the embeddings of future patches of the D target dimensions are passed through a residual block to produce the direct multi-step quantile forecast  $ \hat{Z} \in R^{H \times D \times |Q|} $ . By producing forecasts for multiple target patches within a single forward pass, the model can efficiently generate predictions over long forecast horizons. Chronos-2 predicts a set of 21 quantiles  $ Q = \{0.01, 0.05, 0.1, \ldots, 0.9, 0.95, 0.99\} $ . This results in a richer representation of the predictive distribution compared to the 9-quantile grid  $ \{0.1, 0.2, \ldots, 0.9\} $  commonly used in existing pretrained models. The inclusion of extreme quantiles (0.01 and 0.99) improves coverage of rare events and enhances the model's applicability to tasks such as anomaly detection and risk-aware forecasting.
+
+### 3.3 Training
+
+During training, batches are constructed to include heterogeneous forecasting tasks: univariate forecasting, multivariate forecasting (which also covers tasks with past-only covariates), and multivariate forecasting with known covariates. Each task is characterized by the number of target dimensions D, the number of covariates M, and the role of each dimension (target, past-only covariate, or known covariate). A unique group ID is assigned to each task, and the combination of group IDs g with whether the future input W is observed allows the model to infer the specific forecasting setup.
+
+The model is trained using the quantile regression objective
+
+$$  \sum_{q\in\mathcal{Q}}\Big(q\cdot\max(z-\hat{z}^{q},0)+(1-q)\cdot\max(\hat{z}^{q}-z,0)\Big),   \tag*{(4)}$$
+
+where  $ \hat{z}^{q} $  is the forecast at quantile level q, and z is the corresponding target value normalized as in Eq. (1). The loss is averaged over all forecast steps and items in the batch and is computed only on target dimensions, with entries corresponding to known covariates or missing target values excluded from the objective. The number of output patches is randomly sampled for each batch during training.
+
+Training proceeds in two stages. First, the model is pretrained with a maximum context length of 2048 and a low number of maximum output patches. In the second stage, the context length is extended to 8192, and the maximum number of sampled output patches is increased. Longer contexts enable the model to capture long-term seasonalities in high-frequency time series, while multi-patch outputs allow for long-horizon forecasts without relying on heuristics.
+
+### 3.4 Inference
+
+Forecasts are generated by de-normalizing the model predictions  $ \hat{z}_{t,d}^{q} $  and inverting Eq. (1). Formally, the quantile head output  $ \hat{z}_{t,d}^{q} $  is transformed as
+
+$$  \hat{y}_{t,d}^{q}=\mu_{d}+\sigma_{d}\cdot\sinh(\hat{z}_{t,d}^{q}),   \tag*{(5)}$$
+
+to obtain the prediction  $ \hat{y}_{t,d}^{q} $  of the quantile level q at time step t along the target dimension d.
+
+During inference, multiple time series in a batch can be grouped to solve different forecasting tasks:
+
+ univariate forecasting: each item in the batch is assigned a unique group ID. This ensures that the model makes independent predictions for each time series in the batch.
+
+ multivariate forecasting: each variate which belongs to the same multivariate series is assigned the same group ID with variates from different multivariate series having distinct group IDs. This allows the model to share dynamics information between different variates of a multivariate time series.
+
+ forecasting with covariates: all target(s), past-only and known covariates belonging to the same task are assigned the same group ID. The future inputs W corresponding to known covariates contain their known future values. The predictions generated by the model for covariates are ignored. $$ \boldsymbol{g}=(1,2,3) $$ 
+

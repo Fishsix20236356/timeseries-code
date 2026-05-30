@@ -1,0 +1,100 @@
+1. 阅读moment和chronos技术论文。
+2. 查找两个模型代码库和使用说明。
+3. 与ai多轮协商，完成moment和chronos联合微调架构的设计。
+4. 通过列出论文对应点，校对模型训练细节，弥补架构差异。
+5. 探讨所需参考代码，确定是否改动
+6. 确定GPU，模型参数，训练环境，为后续调超参做准备
+
+
+结合 **MOMENT**（作为强大的通用特征提取器）和 **Chronos-2**（作为拥有概率预测和上下文学习能力的解码/预测器） **MOMENT + Chronos-2 联合训练框架** 的详细设计流程。
+
+---
+
+### 核心架构设计流程
+
+该框架分为五个关键阶段：**双重预处理**、**历史特征提取（MOMENT）**、**特征桥接与序列重构**、**预测生成（Chronos-2）** 以及 **联合优化**。
+
+#### 第一阶段：双轨数据预处理 (Dual-Track Preprocessing)
+
+由于两个模型对输入数据的分布要求完全不同，必须采用“输入分离，目标一致”的策略。
+
+1. **MOMENT 输入流（历史数据 ）：**
+* 使用 MOMENT 原生的 **Reversible Instance Normalization (RevIN)** 处理原始历史数据。
+* **原因：** MOMENT 的预训练权重是在这种分布下习得的，保持其原生的归一化方式能最大化特征提取效率。
+
+
+2. **Chronos-2 目标流（未来真值 ）：**
+* 对整个序列（历史+未来）计算均值  和标准差 。
+* 应用 **标准化 +  变换** 。
+* **原因：** Chronos-2 的 Quantile Head 是为了预测  空间中的分布而设计的 。
+
+
+
+
+
+#### 第二阶段：历史特征编码 (History Encoding via MOMENT)
+
+利用 MOMENT 处理历史窗口，提取深层时序依赖。
+
+* **输入：** 经过 RevIN 处理的历史 Patch 序列。
+* **处理：** * 通过 Patch Embedding 层。
+* 通过 Transformer Encoder Layers。
+
+
+* **微调策略：**
+* **冻结 (Freeze)：** 冻结 MOMENT 的 Patch Embedding 层和前  层 Transformer Block。
+* **解冻 (Unfreeze)：** 仅对最后 1-2 层 Transformer Block 进行微调，使其适应特定领域的特征 。
+* **输出：** 历史隐向量 ，其中  是历史 Patch 的数量。
+
+#### 第三阶段：特征投影与时序重构 (Projection & Temporal Reconstruction)
+这是最关键的“桥梁”部分。必须在此处显式注入 Chronos-2 所需的全局时间观。
+1. **维度对齐 (Projector)：**
+* 使用一个线性层（Linear Layer）或 MLP 将  从  映射到 Chronos-2 的维度 。
+* 得到 。
+2. **构建未来占位符 (Learnable Future Tokens)：**
+* MOMENT 无法输出未来的 Embedding。
+* 初始化一组 **可学习的向量 (Learnable Queries)** 作为未来 Patch 的初始 Embedding，记为 。
+3. **注入 Meta-Features (Time Index & Mask)：**
+* **问题：** 此时  和  只有语义信息，没有全局时间概念。Chronos-2 需要知道它们在整个  时间轴上的绝对/相对位置 。
+* **操作：** * **Time Index Embedding:** 生成全局时间索引 ，涵盖历史和未来 。将其通过 Chronos-2 的 Embedding 层映射为向量 。
+* **Mask Embedding:** 生成 Mask （历史为 1，未来为 0），并映射为向量 。
+* **加法融合：**
+4. **序列拼接 (Sequence Concatenation)：**
+* 插入特殊的 **REG Token** 作为分隔符 。
+* 最终输入序列 。
+
+
+#### 第四阶段：预测与上下文学习 (Forecasting via Chronos-2)
+
+Chronos-2 接收包含丰富历史语义（来自 MOMENT）和精确位置信息（来自 Meta-Features）的序列。
+
+* **模型架构：** T5 Encoder 。
+* **微调策略 (LoRA)：**
+* 在 Attention 层（Q, K, V, Output projections）注入 **LoRA (Low-Rank Adaptation)** 模块。
+* 保持 Chronos-2 的预训练权重冻结，仅训练 LoRA 参数和 Quantile Head。
+* **机制：**
+* **Time Attention:** 处理时间轴上的依赖 。
+* **Group Attention:** 如果是多变量预测，利用 Group Attention 在不同变量间共享信息，实现 Cross-variate Learning 。
+* **输出：** 针对未来部分的 Patch Embedding。
+
+#### 第五阶段：损失计算 (Loss Calculation)
+
+* **解码头 (Quantile Head)：** 输出 21 个分位数预测  。
+* **目标构建：** * 取第一阶段中经过  变换的未来真值 。
+* **损失函数：** Quantile Loss (Pinball Loss) 。
+* **反向传播路径：** Loss  Chronos Quantile Head  Chronos LoRA Layers  Projector  MOMENT Last Blocks (Unfrozen)  Learnable Future Tokens.
+
+---
+
+### 总结关键点清单
+
+| 组件 | 设置/操作 | 引用依据 |
+| --- | --- | --- |
+| **MOMENT 输入** | 保持 **RevIN** 或其预训练时的归一化方式。 | [用户约束] |
+| **Chronos 目标** | 标准化后进行 **** 变换。 |  |
+| **MOMENT 微调** | 仅微调最后 1-2 层 Transformer Block。|  |
+| **特征桥接** | 必须在 Projector 后 **显式相加** Time Index Embedding。 |  |
+| **未来输入** | 使用 **可学习的向量 (Learnable Tokens)** 填充。 | [逻辑推断] |
+| **分隔符** | 在历史和未来之间插入 **REG Token**。 |  |
+| **Chronos 微调** | 使用 **LoRA** 适配 T5 Encoder 部分。 | [用户约束] |
+| **输出形式** | 21 个分位数 (Quantiles)，用于概率预测。 |  |

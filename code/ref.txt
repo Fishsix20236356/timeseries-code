@@ -1,0 +1,11 @@
+model.py: 作为参考库，新建一个类，复用其中的 Chronos2Encoder、_compute_loss 和 InstanceNorm，并替换掉 encode 逻辑。
+
+模块,关键文件路径,作用
+Chronos 数据处理,dataset.py,负责 Chronos 的 sinh−1 变换和 Target 准备
+Chronos 模型架构,model.py,包含 T5 Encoder输入接口、Quantile Head输出格式  和 Loss 计算，参考其内置的 Quantile Loss (Pinball Loss) 实现逻辑
+MOMENT 编码器,moment.py,获取 MOMENT 的 Patch Embedding 和 Encoder 输出，实现层冻结/解冻 (Freeze/Unfreeze) 策略
+MOMENT 归一化,revin.py,参考 RevIN 的实现，用于历史数据预处理
+MOMENT 嵌入,embed.py Patch Embedding 的维度和处理方式，以便在 Step 3 中进行维度对齐的 Projector。
+Chronos 维度配置, config.py, 获取 维度参数，用于初始化 Projector 和可学习的 Future Tokens
+时间/Mask 注入, `layers.py`, 复用 Time Index Embedding 类和 REG Token 的定义，实现 Meta-Features 注入
+

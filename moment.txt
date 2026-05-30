@@ -1,0 +1,22 @@
+3.3. Pre-training using Masked Time series Modeling
+We pre-train MOMENT using the masked time series modeling task. Fig. 3 presents an overview of our pre-training procedure. During training, we first mask a small number of patches uniformly at random by replacing their patch embeddings with a learnable mask embedding [MASK]. The corrupted time series patches are then fed into the transformer encoder to learn patch representations, which are used to reconstruct the original time series using a lightweight reconstruction head. The pre-training objective is to minimize the masked reconstruction error i.e. the Mean Squared Error between the ground truth and the prediction, averaged over the masked patches.
+
+Fine-tuning settings. MOMENT can either be fine-tuned
+end-to-end, or linear probed (MOMENTLP) by freezing all parameters except for those in the reconstruction or forecasting head. Additionally, for some tasks such as anomaly detection, unsupervised representation learning and imputation, MOMENT can also be used in a zero-shot (MOMENT0) setting by retaining its reconstruction head.
+
+MOMENT Captures the Language of Time Series
+Principal components of the embeddings of synthetically generated sinusoids suggest that MOMENT can capture subtle trend, scale, frequency, and phase information
+
+MOMENT Learns Meaningful Representation of Data
+PCA visualizations of representations learned by MOMENT on the ECG5000 dataset in UCR Classification Archive. Here different colors represent different classes. Even without dataset-specific fine-tuning, MOMENT learns distinct representations for different classes.
+
+Representation Learning Code
+```
+from momentfm import MOMENTPipeline
+
+model = MOMENTPipeline.from_pretrained(
+    "AutonLab/MOMENT-1-large", 
+    model_kwargs={"task_name": "embedding"},
+)
+model.init()
+```
